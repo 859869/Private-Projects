@@ -3,6 +3,11 @@ LLM-Generated Rule-Based Neighbor Pruner
 Domain-specific pruning using interpretable, zero-shot rules
 """
 import numpy as np
+import math
+import re
+from collections import Counter
+from functools import lru_cache
+from html import unescape
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 from .domain_rules import get_domain_rules
@@ -18,6 +23,12 @@ class LLMRulePruner:
     - Zero-shot: No training data required
     - Efficient: Simple rule evaluation at inference time
     """
+
+    _STOP_WORDS = frozenset({
+        'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from',
+        'in', 'into', 'is', 'it', 'of', 'on', 'or', 'that', 'the', 'this',
+        'to', 'was', 'were', 'with', 'you', 'your', 'nan', 'none', 'null',
+    })
     
     def __init__(
         self,
@@ -26,6 +37,7 @@ class LLMRulePruner:
         dataset=None,
         mix_min_users: int = 4,
         mix_min_items: int = 6,
+        memory_storage=None,
     ):
         """
         Initialize LLM rule pruner
@@ -34,12 +46,14 @@ class LLMRulePruner:
             dataset_name: Name of dataset (e.g., 'instructrec-books')
             k: Total number of neighbors to select
             dataset: Dataset instance (for metadata access)
+            memory_storage: MemoryStorage instance (for current user/item memories)
             mix_min_users: Minimum number of user neighbors
             mix_min_items: Minimum number of item neighbors
         """
         self.dataset_name = dataset_name
         self.k = k
         self.dataset = dataset
+        self.memory_storage = memory_storage
         self.mix_min_users = mix_min_users
         self.mix_min_items = mix_min_items
         
@@ -47,6 +61,46 @@ class LLMRulePruner:
         self.rules_class = get_domain_rules(dataset_name)
         print(f"  LLMRulePruner: Using {self.rules_class.__name__} for {dataset_name}")
         print(f"  Rules: {self.rules_class.get_description()}")
+
+    @classmethod
+    def _text_features(cls, text: str) -> Counter:
+        """Build a small lexical feature vector from metadata or memory text."""
+        if not text:
+            return Counter()
+        cleaned = re.sub(r'<[^>]+>', ' ', unescape(str(text))).lower()
+        return Counter(
+            token for token in re.findall(r"[a-z0-9]+", cleaned)
+            if len(token) > 1 and token not in cls._STOP_WORDS
+        )
+
+    @staticmethod
+    def _cosine_similarity(left: Counter, right: Counter) -> float:
+        if not left or not right:
+            return 0.0
+        dot = sum(count * right.get(token, 0) for token, count in left.items())
+        left_norm = math.sqrt(sum(count * count for count in left.values()))
+        right_norm = math.sqrt(sum(count * count for count in right.values()))
+        return dot / (left_norm * right_norm) if dot else 0.0
+
+    @lru_cache(maxsize=20000)
+    def _item_text_features(self, item_id: int) -> Counter:
+        metadata = getattr(self.dataset, 'item_metadata', None) or {}
+        item = metadata.get(item_id, {})
+        title = item.get('title', '')
+        description = item.get('description', '')
+        # Metadata descriptions may contain long review lists; bound work per item.
+        return self._text_features(f"{title} {title} {str(description)[:300]}")
+
+    def _metadata_overlap(self, item_id: int, history_item_ids: List[int]) -> float:
+        """Compare an item with the user's other recent history items."""
+        item_features = self._item_text_features(item_id)
+        if not item_features:
+            return 0.0
+        return max(
+            (self._cosine_similarity(item_features, self._item_text_features(other_id))
+             for other_id in history_item_ids[-20:] if other_id != item_id),
+            default=0.0,
+        )
     
     def extract_features(
         self,
@@ -90,16 +144,15 @@ class LLMRulePruner:
             features['recency_days'] = 0
         
         # Metadata overlap score (content similarity)
-        # This should be computed externally based on domain-specific metadata
         features['metadata_overlap_score'] = neighbor.get('metadata_overlap', 0.0)
         
         # Memory similarity score
         if user_memory and neighbor_memory:
-            # Compute cosine similarity between memories
-            # For now, use provided score or default to 0
-            features['memory_similarity_score'] = neighbor.get('memory_sim', 0.0)
+            features['memory_similarity_score'] = self._cosine_similarity(
+                self._text_features(user_memory), self._text_features(neighbor_memory)
+            )
         else:
-            features['memory_similarity_score'] = 0.0
+            features['memory_similarity_score'] = neighbor.get('memory_sim', 0.0)
         
         return features
     
@@ -144,8 +197,8 @@ class LLMRulePruner:
             user_id: User ID
             graph: UserItemGraph instance
             candidates: Optional list of candidate item IDs
-            user_memory: User's memory string (unused in basic version)
-            neighbor_memories: Dict mapping neighbor_id -> memory string (unused)
+            user_memory: Optional override for the user's stored memory
+            neighbor_memories: Optional mapping of (type, id) to memory text
         
         Returns:
             pruned_result: Dict with 'neighbors' key containing selected neighbors
@@ -155,17 +208,16 @@ class LLMRulePruner:
         
         # Get neighbors from graph
         neighbor_data = graph.get_user_neighbors(user_id, max_items=100, max_users=50)
+        history_item_ids = graph.get_user_items(user_id)
+        if user_memory is None and self.memory_storage is not None:
+            user_memory = self.memory_storage.get_user_memory(user_id)
         
         # Convert to uniform format
         candidate_neighbors = []
         
         # Add item neighbors
         for item_id, recency in neighbor_data['item_neighbors']:
-            # Compute metadata overlap if dataset available
-            metadata_overlap = 0.0
-            if self.dataset and hasattr(self.dataset, 'item_metadata'):
-                # TODO: Implement metadata similarity computation
-                metadata_overlap = 0.5  # Placeholder
+            metadata_overlap = self._metadata_overlap(item_id, history_item_ids)
             
             # Use recency as edge weight for items (0-1 score)
             edge_weight = recency if recency else 0.5
@@ -181,7 +233,6 @@ class LLMRulePruner:
                 'score': edge_weight,
                 'metadata_overlap': metadata_overlap,
                 'co_count': 0,  # Not applicable for items
-                'memory_sim': 0.0,  # Placeholder
                 'timestamp': days_ago,
             })
         
@@ -197,7 +248,6 @@ class LLMRulePruner:
                 'score': edge_weight,
                 'metadata_overlap': 0.0,  # Not applicable for users
                 'co_count': overlap_count,
-                'memory_sim': 0.0,  # Placeholder
                 'timestamp': 0,  # Users don't have recency
             })
         
@@ -206,8 +256,19 @@ class LLMRulePruner:
         
         # Score all neighbors
         scored_neighbors = []
+        user_memory_features = self._text_features(user_memory)
         for neighbor in candidate_neighbors:
-            score = self.score_neighbor(neighbor, user_memory, None)
+            neighbor_type, neighbor_id = neighbor['type'], neighbor['id']
+            neighbor_memory = (neighbor_memories or {}).get((neighbor_type, neighbor_id))
+            if neighbor_memory is None and self.memory_storage is not None:
+                if neighbor_type == 'item':
+                    neighbor_memory = self.memory_storage.get_item_memory(neighbor_id)
+                else:
+                    neighbor_memory = self.memory_storage.get_user_memory(neighbor_id)
+            neighbor['memory_sim'] = self._cosine_similarity(
+                user_memory_features, self._text_features(neighbor_memory)
+            )
+            score = self.score_neighbor(neighbor)
             scored_neighbors.append((score, neighbor))
         
         # Sort by score (descending)
@@ -294,6 +355,7 @@ class LLMRulePrunerAdapter:
             dataset=dataset,
             mix_min_users=kwargs.get('mix_min_users', 4),
             mix_min_items=kwargs.get('mix_min_items', 6),
+            memory_storage=kwargs.get('memory_storage'),
         )
         self.k = k
     
