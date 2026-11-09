@@ -82,6 +82,8 @@ def save_results(config, valid_metrics, test_metrics, save_dir):
             pruner_type = 'predefined_rules'
         elif pruner_mode == 'learned_mlp':
             pruner_type = 'learned_mlp'
+        elif pruner_mode == 'personalized_user':
+            pruner_type = 'personalized_user_weights'
         else:
             pruner_type = 'unknown'
         

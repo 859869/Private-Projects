@@ -89,9 +89,15 @@ class MemRecAgent:
         print("Building user-item graph...")
         self.graph = UserItemGraph(dataset)
         print(self.graph)
+
+        self.storage = MemoryStorage()
+        if dataset.item_metadata:
+            self.storage.initialize_item_descriptions(dataset.item_metadata)
         
         # Initialize components
-        if pruner_mode == "llm_rules":
+        if pruner_mode in ("llm_rules", "personalized_user"):
+            if pruner_mode == "personalized_user" and not pruner_checkpoint:
+                raise ValueError("personalized_user mode requires pruner_checkpoint")
             # Use LLM-generated domain-specific rules
             self.pruner = LLMRulePruner(
                 dataset_name=dataset.name if hasattr(dataset, 'name') else 'instructrec-books',
@@ -99,6 +105,8 @@ class MemRecAgent:
                 dataset=dataset,
                 mix_min_users=mix_min_users,
                 mix_min_items=mix_min_items,
+                memory_storage=self.storage,
+                user_weight_checkpoint=pruner_checkpoint if pruner_mode == "personalized_user" else None,
             )
             print(f"  Using LLM Rule-Based Pruner for domain-specific neighbor selection")
         else:
@@ -112,11 +120,6 @@ class MemRecAgent:
             )
         self.packer = SnippetPacker(tau=tau)
         self.manager = MemRecManager(llm_client)
-        self.storage = MemoryStorage()
-        
-        # Initialize item descriptions from metadata
-        if dataset.item_metadata:
-            self.storage.initialize_item_descriptions(dataset.item_metadata)
         
         # Initialize Reranker
         if reranker_mode == "llm":
